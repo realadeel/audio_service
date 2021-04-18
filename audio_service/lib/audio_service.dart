@@ -1004,7 +1004,7 @@ class AudioService {
     } catch (e) {
       print("While deactivating audio session: $e");
     }
-    await _platform.stopService(const StopServiceRequest());
+    // await _platform.stopService(const StopServiceRequest());
   }
 
   static Future<void> _loadAllArtwork(List<MediaItem> queue) async {
