@@ -12,7 +12,6 @@ static NSHashTable<AudioServicePlugin *> *plugins = nil;
 static FlutterMethodChannel *handlerChannel = nil;
 static FlutterResult startResult = nil;
 static MPRemoteCommandCenter *commandCenter = nil;
-static NSArray *queue = nil;
 static NSMutableDictionary *mediaItem = nil;
 static long actionBits = 0;
 static NSMutableArray *commands;
@@ -28,6 +27,7 @@ static NSNumber *shuffleMode = nil;
 static NSNumber *fastForwardInterval = nil;
 static NSNumber *rewindInterval = nil;
 static MPMediaItemArtwork* artwork = nil;
+static NSMutableDictionary *nowPlayingInfo = nil;
 
 @implementation AudioServicePlugin {
     FlutterMethodChannel *_channel;
@@ -53,6 +53,7 @@ static MPMediaItemArtwork* artwork = nil;
             speed = [NSNumber numberWithDouble: 1.0];
             repeatMode = @(0);
             shuffleMode = @(0);
+            nowPlayingInfo = [NSMutableDictionary new];
             handlerChannel = [FlutterMethodChannel
                 methodChannelWithName:@"com.ryanheise.audio_service.handler.methods"
                       binaryMessenger:[registrar messenger]];
@@ -87,6 +88,7 @@ static MPMediaItemArtwork* artwork = nil;
 }
 
 - (void)activateCommandCenter {
+    NSLog(@"### activateCommandCenter");
     commandCenter = [MPRemoteCommandCenter sharedCommandCenter];
     commands = [NSMutableArray new];
     [commands addObjectsFromArray:@[
@@ -135,30 +137,6 @@ static MPMediaItemArtwork* artwork = nil;
     [commandCenter.bookmarkCommand setEnabled:NO];
 }
 
-- (void)broadcastPlaybackState {
-    NSMutableArray *systemActions = [NSMutableArray new];
-    for (int actionIndex = 0; actionIndex < 64; actionIndex++) {
-        if ((actionBits & (1 << actionIndex)) != 0) {
-            [systemActions addObject:@(actionIndex)];
-        }
-    }
-    NSLog(@"XXX: broadcasting state");
-    [self invokeClientMethod:@"onPlaybackStateChanged" arguments:@{
-            @"state":@{
-                    @"processingState": @(processingState),
-                    @"playing": @(playing),
-                    @"controls": @[],
-                    @"systemActions": systemActions,
-                    @"updatePosition": position,
-                    @"bufferedPosition": bufferedPosition,
-                    @"speed": speed,
-                    @"updateTime": updateTime,
-                    @"repeatMode": repeatMode,
-                    @"shuffleMode": shuffleMode,
-            }
-    }];
-}
-
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     if ([@"configure" isEqualToString:call.method]) {
         NSDictionary *args = (NSDictionary *)call.arguments;
@@ -190,7 +168,9 @@ static MPMediaItemArtwork* artwork = nil;
             actionBits |= actionCode;
         }
         processingState = [stateMap[@"processingState"] intValue];
-        BOOL wasPlaying = playing;
+        BOOL oldPlaying = playing;
+        NSNumber *oldSpeed = speed;
+        NSNumber *oldPosition = position;
         playing = [stateMap[@"playing"] boolValue];
         position = stateMap[@"updatePosition"];
         bufferedPosition = stateMap[@"bufferedPosition"];
@@ -204,18 +184,14 @@ static MPMediaItemArtwork* artwork = nil;
 #endif
             [self activateCommandCenter];
         }
-        [self broadcastPlaybackState];
         [self updateControls];
-        if (playing != wasPlaying) {
+        if (playing != oldPlaying ||
+            speed.doubleValue != oldSpeed.doubleValue ||
+            position.longLongValue != oldPosition.longLongValue) {
             [self updateNowPlayingInfo];
         }
         result(@{});
     } else if ([@"setQueue" isEqualToString:call.method]) {
-        NSDictionary *args = (NSDictionary *)call.arguments;
-        queue = args[@"queue"];
-        [self invokeClientMethod:@"onQueueChanged" arguments:@{
-            @"queue":queue
-        }];
         result(@{});
     } else if ([@"setMediaItem" isEqualToString:call.method]) {
         NSDictionary *args = (NSDictionary *)call.arguments;
@@ -246,7 +222,6 @@ static MPMediaItemArtwork* artwork = nil;
             }
         }
         [self updateNowPlayingInfo];
-        [self invokeClientMethod:@"onMediaItemChanged" arguments:call.arguments];
         result(@{});
     } else if ([@"setPlaybackInfo" isEqualToString:call.method]) {
         result(@{});
@@ -280,26 +255,65 @@ static MPMediaItemArtwork* artwork = nil;
     return MPRemoteCommandHandlerStatusSuccess;
 }
 
-- (void) updateNowPlayingInfo {
-    NSMutableDictionary *nowPlayingInfo = [NSMutableDictionary new];
-    if (mediaItem) {
-        nowPlayingInfo[MPMediaItemPropertyTitle] = mediaItem[@"title"];
-        nowPlayingInfo[MPMediaItemPropertyAlbumTitle] = mediaItem[@"album"];
-        if (mediaItem[@"artist"] != [NSNull null]) {
-            nowPlayingInfo[MPMediaItemPropertyArtist] = mediaItem[@"artist"];
+- (BOOL)updateNowPlayingField:(NSString *)field value:(id)value {
+    if (![value isEqual:nowPlayingInfo[field]]) {
+        if (value != nil && value != [NSNull null]) {
+            NSLog(@"### %@ = '%@'", field, value);
+            nowPlayingInfo[field] = value;
+        } else {
+            NSLog(@"### %@ = nil", field);
+            [nowPlayingInfo removeObjectForKey:field];
         }
-        if (mediaItem[@"duration"] != [NSNull null]) {
-            nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = [NSNumber numberWithLongLong: ([mediaItem[@"duration"] longLongValue] / 1000)];
-        }
-        if (@available(iOS 3.0, macOS 10.13.2, *)) {
-            if (artwork) {
-                nowPlayingInfo[MPMediaItemPropertyArtwork] = artwork;
-            }
-        }
-        nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = [NSNumber numberWithInt:([position intValue] / 1000)];
+        return YES;
     }
-    nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = playing ? speed: [NSNumber numberWithDouble: 0.0];
-    [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = nowPlayingInfo;
+    return NO;
+}
+
+- (void) updateNowPlayingInfo {
+    BOOL updated = NO;
+    if (mediaItem) {
+        updated |= [self updateNowPlayingField:MPMediaItemPropertyTitle value:mediaItem[@"title"]];
+        updated |= [self updateNowPlayingField:MPMediaItemPropertyAlbumTitle value:mediaItem[@"album"]];
+        updated |= [self updateNowPlayingField:MPMediaItemPropertyArtist value:mediaItem[@"artist"]];
+        NSNumber *duration = mediaItem[@"duration"];
+        if (duration == (id)[NSNull null]) duration = @(0);
+        updated |= [self updateNowPlayingField:MPMediaItemPropertyPlaybackDuration value:([NSNumber numberWithDouble: ([duration doubleValue] / 1000)])];
+        if (@available(iOS 3.0, macOS 10.13.2, *)) {
+            updated |= [self updateNowPlayingField:MPMediaItemPropertyArtwork value:artwork];
+        }
+    }
+
+    if (@available(iOS 10.0, macOS 10.12.2, *)) {
+        updated |= [self updateNowPlayingField:MPNowPlayingInfoPropertyMediaType value:@(MPNowPlayingInfoMediaTypeAudio)];
+    }
+    updated |= [self updateNowPlayingField:MPNowPlayingInfoPropertyPlaybackRate value:(playing ? speed : [NSNumber numberWithDouble: 0.0])];
+    updated |= [self updateNowPlayingField:MPNowPlayingInfoPropertyElapsedPlaybackTime value:[NSNumber numberWithDouble:([position doubleValue] / 1000)]];
+    MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
+    if (@available(iOS 13.0, macOS 10.12.2, *)) {
+        center.playbackState = playing ? MPNowPlayingPlaybackStatePlaying : MPNowPlayingPlaybackStatePaused;
+    }
+    if (updated) {
+        NSLog(@"### updating nowPlayingInfo");
+        center.nowPlayingInfo = nowPlayingInfo;
+    }
+  
+    // TODO: List of all unused "nowPlayingInfo" keys, we might want to use these at some point:
+    //
+    // * MPNowPlayingInfoCollectionIdentifier
+    // * MPNowPlayingInfoPropertyAvailableLanguageOptions
+    // * MPNowPlayingInfoPropertyAssetURL
+    // * MPNowPlayingInfoPropertyChapterCount
+    // * MPNowPlayingInfoPropertyChapterNumber
+    // * MPNowPlayingInfoPropertyCurrentLanguageOptions
+    // * MPNowPlayingInfoPropertyDefaultPlaybackRate
+    // * MPNowPlayingInfoPropertyCurrentPlaybackDate
+    // * MPNowPlayingInfoPropertyExternalContentIdentifier
+    // * MPNowPlayingInfoPropertyExternalUserProfileIdentifier
+    // * MPNowPlayingInfoPropertyIsLiveStream
+    // * MPNowPlayingInfoPropertyPlaybackProgress
+    // * MPNowPlayingInfoPropertyPlaybackQueueCount
+    // * MPNowPlayingInfoPropertyPlaybackQueueIndex
+    // * MPNowPlayingInfoPropertyServiceIdentifier
 }
 
 - (void) updateControls {
@@ -317,6 +331,7 @@ static MPMediaItemArtwork* artwork = nil;
     // All bytes become 0, other than the tested action bit, which will be 0 or 1 according to its status in the actionBits long.
     BOOL enable = ((actionBits >> action) & 1);
     if (_controlsUpdated && enable == command.enabled) return;
+    NSLog(@"## updateControl %@ enable=%@", @(action), @(enable));
     [command setEnabled:enable];
     switch (action) {
         case AStop:
@@ -392,6 +407,7 @@ static MPMediaItemArtwork* artwork = nil;
                     [commandCenter.changePlaybackPositionCommand removeTarget:nil];
                 }
             }
+            break;
         case APlayPause:
             // Automatically enabled.
             break;
@@ -456,8 +472,8 @@ static MPMediaItemArtwork* artwork = nil;
 
 - (MPRemoteCommandHandlerStatus) changePlaybackPosition: (MPChangePlaybackPositionCommandEvent *) event {
     NSLog(@"changePlaybackPosition");
-    [handlerChannel invokeMethod:@"seekTo" arguments: @{
-        @"position":@((long long) (event.positionTime * 1000))
+    [handlerChannel invokeMethod:@"seek" arguments: @{
+        @"position":@((long long) (event.positionTime * 1000000.0))
     }];
     return MPRemoteCommandHandlerStatusSuccess;
 }
